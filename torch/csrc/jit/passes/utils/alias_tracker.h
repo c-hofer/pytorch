@@ -4,6 +4,7 @@
 
 namespace torch {
 namespace jit {
+
 // class AliasTracker
 //
 // This class tracks the "A points to B" graph for all values, as well as
@@ -13,11 +14,61 @@ class AliasTracker {
   // Returns true iff `v` is present in the alias set tracker.
   bool contains(const Value* v) const;
 
+  // Do `a` and `b` potentially share a memory location?
+  bool mayAlias(const Value* a, const Value* b) const;
+
+  // Do any values in group `a` potentailly share a memory location with any
+  // value in group `b`?
+  //
+  // This is written so that either of the inputs could be a multiset
+  template <typename T, typename U>
+  bool mayAlias(const T& a, const U& b) const {
+    if (a.empty() || b.empty()) {
+      return false;
+    }
+
+    // Record all memory locations from group `a`
+    std::unordered_set<const Element*> memoryLocations;
+    for (auto it = a.cbegin(); it != a.cend();) {
+      const auto value = *it;
+      if (isWildcard(value)) {
+        return true;
+      }
+
+      if (map_.count(value)) {
+        for (const auto loc : map_.at(value)->getMemoryLocations()) {
+          memoryLocations.insert(loc);
+        }
+      }
+
+      const auto cnt = a.count(*it);
+      std::advance(it, cnt);
+    }
+
+    // If any of group `b`s memory locations overlap, return true.
+    for (auto it = b.cbegin(); it != b.cend();) {
+      const auto value = *it;
+      if (isWildcard(value)) {
+        return true;
+      }
+
+      if (map_.count(value)) {
+        for (const auto loc : map_.at(value)->getMemoryLocations()) {
+          if (memoryLocations.count(loc)) {
+            return true;
+          }
+        }
+      }
+
+      const auto cnt = b.count(*it);
+      std::advance(it, cnt);
+    }
+    // No overlap, so group `a` and `b` do not share a memory location
+    return false;
+  }
+
   // Does `n` write to `v` directly? (Does not consider aliases)
   bool writesTo(Node* n, const Value* v) const;
-
-  // Whether `a` *may* point to `b`
-  bool pointsTo(const Value* a, const Value* b) const;
 
   // Make `v` point at `to`.
   void makePointerTo(const Value* v, const Value* to);
@@ -39,11 +90,7 @@ class AliasTracker {
   // NOTE: this does not consider wildcard values
   std::unordered_set<const Value*> getAliases(const Value* v) const;
 
-  // Get all nodes that write to `v` or a value that may alias `v`.
-  std::unordered_set<Node*> getWrites(const Value* v) const;
-
-  // Functionally equivalent to getWrites().size() > 0, but with a
-  // short-circuiting implementation to be faster.
+  // Does anything write to the memory locations that `v` may point to?
   bool hasWriters(const Value* v) const;
 
   // Get all nodes that write to a wildcard value.
@@ -70,8 +117,9 @@ class AliasTracker {
     std::unordered_set<Element*> pointsTo;
     // Backreference to values that point to `this`
     std::unordered_set<Element*> pointedFrom;
-    // Nodes that write to this specific value.
-    std::unordered_set<Node*> writers;
+
+    std::unordered_set<const Element*> getMemoryLocations() const;
+    mutable std::unordered_set<const Element*> cachedMemoryLocations_;
 
     // Do a breadth-first search over the graph, starting at `this` and
     // traversing in the direction `dir`.`fn` will be run on each element.
@@ -94,25 +142,10 @@ class AliasTracker {
   std::unordered_set<Node*> wildcardWriters_;
   size_t numWrites_ = 0;
 
-  /**
-   * Caching layer.
-   */
-  using set_id_t = size_t;
-  bool useCache_ = true;
-  mutable std::unordered_map<const Element*, std::unordered_set<set_id_t>>
-      elementToSet_;
-  mutable std::unordered_map<set_id_t, std::unordered_set<Node*>> setToWrites_;
+  std::unordered_map<Node*, std::unordered_set<const Value*>> writeIndex_;
+  mutable std::unordered_set<const Element*> cachedWrittenToLocs_;
   mutable bool cacheStale_ = true;
-  mutable set_id_t lastId = 0;
-
-  // Cache results in a way to make common queries constant time.
-  void cache() const;
-  bool hasWritersCached(const Value* v) const;
-  std::unordered_set<Node*> getWritersCached(const Value* v) const;
-  bool assignSet(const Element* el, set_id_t id) const;
-  set_id_t getFreshId() const {
-    return ++lastId;
-  };
+  void rebuildCache() const;
 };
 
 } // namespace jit
